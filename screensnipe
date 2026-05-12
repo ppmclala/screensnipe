@@ -43,72 +43,115 @@ while getopts "d:o:D:qh" opt; do
     esac
 done
 
+SESSION="${XDG_SESSION_TYPE:-x11}"
+
 # Check dependencies
-for cmd in ffmpeg slop; do
-    if ! command -v "$cmd" &>/dev/null; then
-        echo "Error: '$cmd' is not installed." >&2
-        echo "Install with: sudo apt install ffmpeg slop" >&2
-        exit 1
-    fi
-done
+if [[ "$SESSION" == "wayland" ]]; then
+    for cmd in ffmpeg slurp wf-recorder; do
+        if ! command -v "$cmd" &>/dev/null; then
+            echo "Error: '$cmd' is not installed." >&2
+            echo "Install with: sudo apt install ffmpeg slurp wf-recorder" >&2
+            exit 1
+        fi
+    done
+else
+    for cmd in ffmpeg slop; do
+        if ! command -v "$cmd" &>/dev/null; then
+            echo "Error: '$cmd' is not installed." >&2
+            echo "Install with: sudo apt install ffmpeg slop" >&2
+            exit 1
+        fi
+    done
+fi
 
 mkdir -p "$(dirname "$OUTFILE")"
 
-info "Select the region to record..."
-read -r X Y W H < <(slop -f "%x %y %w %h" -b 4 -c 0.2,0.8,0.2,0.9) || true
-
-# Ensure width and height are even numbers (required by ffmpeg)
-W=$(( W & ~1 ))
-H=$(( H & ~1 ))
-
-info "Recording ${W}x${H} region for up to ${DURATION}s — click Stop to finish early..."
-
 TMPFILE=$(mktemp /tmp/screensnipe-XXXXXX.mkv)
-FFMPEG_PID=
+RECORDER_PID=
 OVERLAY_PID=
-
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-OVERLAY_BIN="$SCRIPT_DIR/border-overlay"
-BORDER_PX=4
-
 CANCELLED=0
-stop_recording()   { [[ -n "$FFMPEG_PID" ]] && kill -INT "$FFMPEG_PID" 2>/dev/null || true; }
-cancel_recording() { CANCELLED=1; [[ -n "$FFMPEG_PID" ]] && kill -INT "$FFMPEG_PID" 2>/dev/null || true; }
-trap stop_recording   SIGUSR1
-trap cancel_recording SIGUSR2
+
 trap 'rm -f "$TMPFILE"; [[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null || true' EXIT
 
-if [[ -x "$OVERLAY_BIN" ]]; then
-    # Overlay handles the visual countdown then shows border + stop button
-    "$OVERLAY_BIN" "$X" "$Y" "$W" "$H" $BORDER_PX "$DELAY" $$ &
-    OVERLAY_PID=$!
-    sleep "$DELAY"
-else
-    # Fallback: terminal countdown
+countdown() {
     for (( i=DELAY; i>0; i-- )); do
         infof "\r  Starting in %s..." "$i"
         sleep 1
     done
+    infof "\r  Recording...   \n"
+}
+
+if [[ "$SESSION" == "wayland" ]]; then
+    info "Select the region to record..."
+    GEOMETRY=$(slurp -b 00000000) || exit 1
+
+    # Parse "X,Y WxH" into components for border-overlay
+    IFS=', x' read -r GX GY GW GH <<< "$GEOMETRY"
+
+    SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    OVERLAY_BIN="$SCRIPT_DIR/border-overlay-wayland"
+
+    stop_recording()   { [[ -n "$RECORDER_PID" ]] && kill -INT "$RECORDER_PID" 2>/dev/null || true; }
+    cancel_recording() { CANCELLED=1; stop_recording; }
+    trap stop_recording   SIGUSR1
+    trap cancel_recording SIGUSR2
+
+    if [[ -x "$OVERLAY_BIN" ]]; then
+        "$OVERLAY_BIN" "$GX" "$GY" "$GW" "$GH" 4 "$DELAY" $$ &
+        OVERLAY_PID=$!
+        sleep "$DELAY"
+        infof "\r  Recording...   \n"
+    else
+        countdown
+    fi
+
+    timeout --signal=INT "$DURATION" wf-recorder -g "$GEOMETRY" -r "$FPS" -f "$TMPFILE" &
+    RECORDER_PID=$!
+
+    wait "$RECORDER_PID" || true
+    while kill -0 "$RECORDER_PID" 2>/dev/null; do sleep 0.1; done
+    RECORDER_PID=
+
+    [[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null && OVERLAY_PID= || true
+
+else
+    info "Select the region to record..."
+    read -r X Y W H < <(slop -f "%x %y %w %h" -b 4 -c 0.2,0.8,0.2,0.9) || true
+
+    # Ensure even dimensions (required by ffmpeg)
+    W=$(( W & ~1 ))
+    H=$(( H & ~1 ))
+
+    SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    OVERLAY_BIN="$SCRIPT_DIR/border-overlay"
+
+    stop_recording()   { [[ -n "$RECORDER_PID" ]] && kill -INT "$RECORDER_PID" 2>/dev/null || true; }
+    cancel_recording() { CANCELLED=1; stop_recording; }
+    trap stop_recording   SIGUSR1
+    trap cancel_recording SIGUSR2
+
+    if [[ -x "$OVERLAY_BIN" ]]; then
+        "$OVERLAY_BIN" "$X" "$Y" "$W" "$H" 4 "$DELAY" $$ &
+        OVERLAY_PID=$!
+        sleep "$DELAY"
+        infof "\r  Recording...   \n"
+    else
+        countdown
+    fi
+
+    ffmpeg -y -loglevel error \
+        -f x11grab -r "$FPS" -s "${W}x${H}" -draw_mouse 1 -i "${DISPLAY:-:0}+${X},${Y}" \
+        -t "$DURATION" \
+        -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+        "$TMPFILE" &
+    RECORDER_PID=$!
+
+    wait "$RECORDER_PID" || true
+    while kill -0 "$RECORDER_PID" 2>/dev/null; do sleep 0.1; done
+    RECORDER_PID=
+
+    [[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null && OVERLAY_PID= || true
 fi
-infof "\r  Recording...   \n"
-
-# Record to temp video (background so stop button can interrupt it)
-ffmpeg -y -loglevel error \
-    -f x11grab -r "$FPS" -s "${W}x${H}" -draw_mouse 1 -i "${DISPLAY:-:0}+${X},${Y}" \
-    -t "$DURATION" \
-    -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
-    "$TMPFILE" &
-FFMPEG_PID=$!
-
-wait "$FFMPEG_PID" || true
-# Re-wait until ffmpeg has fully exited — bash's wait returns early on signals
-# but ffmpeg may still be finalizing the file
-while kill -0 "$FFMPEG_PID" 2>/dev/null; do
-    sleep 0.1
-done
-FFMPEG_PID=
-
-[[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null && OVERLAY_PID= || true
 
 if [[ "$CANCELLED" -eq 1 ]]; then
     info "Cancelled."
