@@ -1,0 +1,14 @@
+# screensnipe configuration
+# Copy to ~/.config/screensnipe.conf and edit as needed
+
+# Directory where recordings are saved
+OUTDIR="$HOME/Videos"
+
+# Default recording duration in seconds (user can stop early via the overlay)
+DURATION=300
+
+# Default countdown delay before recording starts
+DELAY=3
+
+# Frames per second
+FPS=15

@@ -1,0 +1,129 @@
+#!/bin/bash
+set -e
+
+# Defaults
+DURATION=10
+OUTDIR="$HOME/Videos"
+DELAY=3
+FPS=15
+QUIET=0
+
+# Load config file if present
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/screensnipe.conf"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+OUTFILE="$OUTDIR/recording-$TIMESTAMP.mp4"
+
+info() { [[ $QUIET -eq 0 ]] && echo "$*" >&2 || true; }
+infof() { [[ $QUIET -eq 0 ]] && printf "$@" >&2 || true; }
+
+usage() {
+    echo "Usage: $(basename "$0") [-d SECONDS] [-o OUTFILE] [-D DELAY] [-q]"
+    echo ""
+    echo "  -d SECONDS   Recording duration (default: $DURATION)"
+    echo "  -o OUTFILE   Output file (default: ~/Videos/recording-TIMESTAMP.mp4)"
+    echo "  -D DELAY     Countdown delay before recording starts (default: $DELAY)"
+    echo "  -q           Quiet mode — suppress output, print only filename on success"
+    echo "  -h           Show this help"
+    exit 0
+}
+
+while getopts "d:o:D:qh" opt; do
+    case $opt in
+        d) DURATION="$OPTARG" ;;
+        o) OUTFILE="$OPTARG" ;;
+        D) DELAY="$OPTARG" ;;
+        q) QUIET=1 ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+# Check dependencies
+for cmd in ffmpeg slop; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: '$cmd' is not installed." >&2
+        echo "Install with: sudo apt install ffmpeg slop" >&2
+        exit 1
+    fi
+done
+
+mkdir -p "$(dirname "$OUTFILE")"
+
+info "Select the region to record..."
+read -r X Y W H < <(slop -f "%x %y %w %h" -b 4 -c 0.2,0.8,0.2,0.9) || true
+
+# Ensure width and height are even numbers (required by ffmpeg)
+W=$(( W & ~1 ))
+H=$(( H & ~1 ))
+
+info "Recording ${W}x${H} region for up to ${DURATION}s — click Stop to finish early..."
+
+TMPFILE=$(mktemp /tmp/screensnipe-XXXXXX.mkv)
+FFMPEG_PID=
+OVERLAY_PID=
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+OVERLAY_BIN="$SCRIPT_DIR/border-overlay"
+BORDER_PX=4
+
+CANCELLED=0
+stop_recording()   { [[ -n "$FFMPEG_PID" ]] && kill -INT "$FFMPEG_PID" 2>/dev/null || true; }
+cancel_recording() { CANCELLED=1; [[ -n "$FFMPEG_PID" ]] && kill -INT "$FFMPEG_PID" 2>/dev/null || true; }
+trap stop_recording   SIGUSR1
+trap cancel_recording SIGUSR2
+trap 'rm -f "$TMPFILE"; [[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null || true' EXIT
+
+if [[ -x "$OVERLAY_BIN" ]]; then
+    # Overlay handles the visual countdown then shows border + stop button
+    "$OVERLAY_BIN" "$X" "$Y" "$W" "$H" $BORDER_PX "$DELAY" $$ &
+    OVERLAY_PID=$!
+    sleep "$DELAY"
+else
+    # Fallback: terminal countdown
+    for (( i=DELAY; i>0; i-- )); do
+        infof "\r  Starting in %s..." "$i"
+        sleep 1
+    done
+fi
+infof "\r  Recording...   \n"
+
+# Record to temp video (background so stop button can interrupt it)
+ffmpeg -y -loglevel error \
+    -f x11grab -r "$FPS" -s "${W}x${H}" -draw_mouse 1 -i "${DISPLAY:-:0}+${X},${Y}" \
+    -t "$DURATION" \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+    "$TMPFILE" &
+FFMPEG_PID=$!
+
+wait "$FFMPEG_PID" || true
+# Re-wait until ffmpeg has fully exited — bash's wait returns early on signals
+# but ffmpeg may still be finalizing the file
+while kill -0 "$FFMPEG_PID" 2>/dev/null; do
+    sleep 0.1
+done
+FFMPEG_PID=
+
+[[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null && OVERLAY_PID= || true
+
+if [[ "$CANCELLED" -eq 1 ]]; then
+    info "Cancelled."
+    exit 0
+fi
+
+infof "\r  Saving...   \n"
+
+# Remux MKV → MP4 (no re-encode)
+ffmpeg -y -loglevel error -i "$TMPFILE" -c copy "$OUTFILE"
+
+info "Saved: $OUTFILE"
+echo "$OUTFILE"
+
+# System tray notification
+if [[ $QUIET -eq 0 ]] && command -v notify-send &>/dev/null; then
+    notify-send "Screen recorded" "$OUTFILE" --icon=camera-video >/dev/null 2>&1 &
+fi
