@@ -3,10 +3,12 @@ set -e
 
 # Defaults
 DURATION=10
-OUTDIR="$HOME/Videos"
+OUTDIR_VIDEO="$HOME/Videos"
+OUTDIR_SCREENSHOT="$HOME/Pictures"
 DELAY=3
 FPS=15
 QUIET=0
+SCREENSHOT=0
 
 # Load config file if present
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/screensnipe.conf"
@@ -16,24 +18,25 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-OUTFILE="$OUTDIR/recording-$TIMESTAMP.mp4"
 
 info() { [[ $QUIET -eq 0 ]] && echo "$*" >&2 || true; }
 infof() { [[ $QUIET -eq 0 ]] && printf "$@" >&2 || true; }
 
 usage() {
-    echo "Usage: $(basename "$0") [-d SECONDS] [-o OUTFILE] [-D DELAY] [-q]"
+    echo "Usage: $(basename "$0") [-s] [-d SECONDS] [-o OUTFILE] [-D DELAY] [-q]"
     echo ""
-    echo "  -d SECONDS   Recording duration (default: $DURATION)"
-    echo "  -o OUTFILE   Output file (default: ~/Videos/recording-TIMESTAMP.mp4)"
-    echo "  -D DELAY     Countdown delay before recording starts (default: $DELAY)"
+    echo "  -s           Screenshot mode — capture a PNG instead of a video"
+    echo "  -d SECONDS   Recording duration (default: $DURATION, ignored with -s)"
+    echo "  -o OUTFILE   Output file (default: ~/Videos/recording-TIMESTAMP.mp4 or ~/Pictures/screenshot-TIMESTAMP.png)"
+    echo "  -D DELAY     Countdown delay before capture starts (default: $DELAY)"
     echo "  -q           Quiet mode — suppress output, print only filename on success"
     echo "  -h           Show this help"
     exit 0
 }
 
-while getopts "d:o:D:qh" opt; do
+while getopts "sd:o:D:qh" opt; do
     case $opt in
+        s) SCREENSHOT=1 ;;
         d) DURATION="$OPTARG" ;;
         o) OUTFILE="$OPTARG" ;;
         D) DELAY="$OPTARG" ;;
@@ -43,17 +46,36 @@ while getopts "d:o:D:qh" opt; do
     esac
 done
 
+OUTFILE_EXPLICIT="${OUTFILE:-}"
+if [[ -z "$OUTFILE_EXPLICIT" ]]; then
+    if [[ "$SCREENSHOT" -eq 1 ]]; then
+        OUTFILE="$OUTDIR_SCREENSHOT/screenshot-$TIMESTAMP.png"
+    else
+        OUTFILE="$OUTDIR_VIDEO/recording-$TIMESTAMP.mp4"
+    fi
+fi
+
 SESSION="${XDG_SESSION_TYPE:-x11}"
 
 # Check dependencies
 if [[ "$SESSION" == "wayland" ]]; then
-    for cmd in ffmpeg slurp wf-recorder; do
-        if ! command -v "$cmd" &>/dev/null; then
-            echo "Error: '$cmd' is not installed." >&2
-            echo "Install with: sudo apt install ffmpeg slurp wf-recorder" >&2
-            exit 1
-        fi
-    done
+    if [[ "$SCREENSHOT" -eq 1 ]]; then
+        for cmd in slurp grim; do
+            if ! command -v "$cmd" &>/dev/null; then
+                echo "Error: '$cmd' is not installed." >&2
+                echo "Install with: sudo apt install slurp grim" >&2
+                exit 1
+            fi
+        done
+    else
+        for cmd in ffmpeg slurp wf-recorder; do
+            if ! command -v "$cmd" &>/dev/null; then
+                echo "Error: '$cmd' is not installed." >&2
+                echo "Install with: sudo apt install ffmpeg slurp wf-recorder" >&2
+                exit 1
+            fi
+        done
+    fi
 else
     for cmd in ffmpeg slop; do
         if ! command -v "$cmd" &>/dev/null; then
@@ -64,14 +86,17 @@ else
     done
 fi
 
-mkdir -p "$(dirname "$OUTFILE")"
-
-TMPFILE=$(mktemp /tmp/screensnipe-XXXXXX.mkv)
+TMPFILE=
+if [[ "$SCREENSHOT" -eq 1 ]]; then
+    TMPFILE=$(mktemp /tmp/screensnipe-XXXXXX.png)
+else
+    TMPFILE=$(mktemp /tmp/screensnipe-XXXXXX.mkv)
+fi
 RECORDER_PID=
 OVERLAY_PID=
 CANCELLED=0
 
-trap 'rm -f "$TMPFILE"; [[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null || true' EXIT
+trap 'rm -f "${TMPFILE:-}"; [[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null || true' EXIT
 
 countdown() {
     for (( i=DELAY; i>0; i-- )); do
@@ -82,7 +107,7 @@ countdown() {
 }
 
 if [[ "$SESSION" == "wayland" ]]; then
-    info "Select the region to record..."
+    [[ "$SCREENSHOT" -eq 1 ]] && info "Select the region to screenshot..." || info "Select the region to record..."
     GEOMETRY=$(slurp -b 00000000) || exit 1
 
     # Parse "X,Y WxH" into components for border-overlay
@@ -100,25 +125,29 @@ if [[ "$SESSION" == "wayland" ]]; then
         "$OVERLAY_BIN" "$GX" "$GY" "$GW" "$GH" 4 "$DELAY" $$ &
         OVERLAY_PID=$!
         sleep "$DELAY"
-        infof "\r  Recording...   \n"
+        [[ "$SCREENSHOT" -eq 1 ]] && infof "\r  Capturing...   \n" || infof "\r  Recording...   \n"
     else
         countdown
     fi
 
-    timeout --signal=INT "$DURATION" wf-recorder -g "$GEOMETRY" -r "$FPS" -f "$TMPFILE" &
-    RECORDER_PID=$!
+    if [[ "$SCREENSHOT" -eq 1 ]]; then
+        grim -g "$GEOMETRY" "$TMPFILE"
+    else
+        timeout --signal=INT "$DURATION" wf-recorder -g "$GEOMETRY" -r "$FPS" -f "$TMPFILE" &
+        RECORDER_PID=$!
 
-    wait "$RECORDER_PID" || true
-    while kill -0 "$RECORDER_PID" 2>/dev/null; do sleep 0.1; done
-    RECORDER_PID=
+        wait "$RECORDER_PID" || true
+        while kill -0 "$RECORDER_PID" 2>/dev/null; do sleep 0.1; done
+        RECORDER_PID=
+    fi
 
     [[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null && OVERLAY_PID= || true
 
 else
-    info "Select the region to record..."
+    [[ "$SCREENSHOT" -eq 1 ]] && info "Select the region to screenshot..." || info "Select the region to record..."
     read -r X Y W H < <(slop -f "%x %y %w %h" -b 4 -c 0.2,0.8,0.2,0.9) || true
 
-    # Ensure even dimensions (required by ffmpeg)
+    # Ensure even dimensions (required by ffmpeg for video)
     W=$(( W & ~1 ))
     H=$(( H & ~1 ))
 
@@ -134,21 +163,28 @@ else
         "$OVERLAY_BIN" "$X" "$Y" "$W" "$H" 4 "$DELAY" $$ &
         OVERLAY_PID=$!
         sleep "$DELAY"
-        infof "\r  Recording...   \n"
+        [[ "$SCREENSHOT" -eq 1 ]] && infof "\r  Capturing...   \n" || infof "\r  Recording...   \n"
     else
         countdown
     fi
 
-    ffmpeg -y -loglevel error \
-        -f x11grab -r "$FPS" -s "${W}x${H}" -draw_mouse 1 -i "${DISPLAY:-:0}+${X},${Y}" \
-        -t "$DURATION" \
-        -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
-        "$TMPFILE" &
-    RECORDER_PID=$!
+    if [[ "$SCREENSHOT" -eq 1 ]]; then
+        ffmpeg -y -loglevel error \
+            -f x11grab -s "${W}x${H}" -draw_mouse 1 -i "${DISPLAY:-:0}+${X},${Y}" \
+            -vframes 1 \
+            "$TMPFILE"
+    else
+        ffmpeg -y -loglevel error \
+            -f x11grab -r "$FPS" -s "${W}x${H}" -draw_mouse 1 -i "${DISPLAY:-:0}+${X},${Y}" \
+            -t "$DURATION" \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+            "$TMPFILE" &
+        RECORDER_PID=$!
 
-    wait "$RECORDER_PID" || true
-    while kill -0 "$RECORDER_PID" 2>/dev/null; do sleep 0.1; done
-    RECORDER_PID=
+        wait "$RECORDER_PID" || true
+        while kill -0 "$RECORDER_PID" 2>/dev/null; do sleep 0.1; done
+        RECORDER_PID=
+    fi
 
     [[ -n "$OVERLAY_PID" ]] && kill "$OVERLAY_PID" 2>/dev/null && OVERLAY_PID= || true
 fi
@@ -158,15 +194,35 @@ if [[ "$CANCELLED" -eq 1 ]]; then
     exit 0
 fi
 
-infof "\r  Saving...   \n"
+# Offer directory picker if no explicit -o was given
+if [[ -z "$OUTFILE_EXPLICIT" ]] && command -v zenity &>/dev/null; then
+    [[ "$SCREENSHOT" -eq 1 ]] && _CAPTURE_WORD="screenshot" || _CAPTURE_WORD="recording"
+    _CHOSEN_DIR=$(zenity --file-selection --directory \
+        --title="Save $_CAPTURE_WORD to..." \
+        --filename="$(dirname "$OUTFILE")/" 2>/dev/null) || true
+    if [[ -n "$_CHOSEN_DIR" ]]; then
+        OUTFILE="$_CHOSEN_DIR/$(basename "$OUTFILE")"
+    fi
+fi
 
-# Remux MKV → MP4 (no re-encode)
-ffmpeg -y -loglevel error -i "$TMPFILE" -c copy "$OUTFILE"
+mkdir -p "$(dirname "$OUTFILE")"
+
+if [[ "$SCREENSHOT" -eq 1 ]]; then
+    mv "$TMPFILE" "$OUTFILE"
+else
+    infof "\r  Saving...   \n"
+    # Remux MKV → MP4 (no re-encode)
+    ffmpeg -y -loglevel error -i "$TMPFILE" -c copy "$OUTFILE"
+fi
 
 info "Saved: $OUTFILE"
 echo "$OUTFILE"
 
 # System tray notification
 if [[ $QUIET -eq 0 ]] && command -v notify-send &>/dev/null; then
-    notify-send "Screen recorded" "$OUTFILE" --icon=camera-video >/dev/null 2>&1 &
+    if [[ "$SCREENSHOT" -eq 1 ]]; then
+        notify-send "Screenshot captured" "$OUTFILE" --icon=camera-photo >/dev/null 2>&1 &
+    else
+        notify-send "Screen recorded" "$OUTFILE" --icon=camera-video >/dev/null 2>&1 &
+    fi
 fi
