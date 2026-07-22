@@ -25,9 +25,9 @@ infof() { [[ $QUIET -eq 0 ]] && printf "$@" >&2 || true; }
 usage() {
     echo "Usage: $(basename "$0") [-s] [-d SECONDS] [-o OUTFILE] [-D DELAY] [-q]"
     echo ""
-    echo "  -s           Screenshot mode — capture a PNG instead of a video"
+    echo "  -s           Screenshot mode — capture a PNG and copy to clipboard"
     echo "  -d SECONDS   Recording duration (default: $DURATION, ignored with -s)"
-    echo "  -o OUTFILE   Output file (default: ~/Videos/recording-TIMESTAMP.mp4 or ~/Pictures/screenshot-TIMESTAMP.png)"
+    echo "  -o OUTFILE   Output file (default: ~/Videos/recording-TIMESTAMP.mp4); with -s, saves to file instead of clipboard"
     echo "  -D DELAY     Countdown delay before capture starts (default: $DELAY)"
     echo "  -q           Quiet mode — suppress output, print only filename on success"
     echo "  -h           Show this help"
@@ -191,6 +191,30 @@ fi
 
 if [[ "$CANCELLED" -eq 1 ]]; then
     info "Cancelled."
+    exit 0
+fi
+
+# Screenshots with no explicit -o go to clipboard
+if [[ "$SCREENSHOT" -eq 1 && -z "$OUTFILE_EXPLICIT" ]]; then
+    if [[ "$SESSION" == "wayland" ]]; then
+        if ! command -v wl-copy &>/dev/null; then
+            echo "Error: 'wl-copy' is not installed." >&2
+            echo "Install with: sudo apt install wl-clipboard" >&2
+            exit 1
+        fi
+        wl-copy --type image/png < "$TMPFILE"
+    else
+        if ! command -v xclip &>/dev/null; then
+            echo "Error: 'xclip' is not installed." >&2
+            echo "Install with: sudo apt install xclip" >&2
+            exit 1
+        fi
+        xclip -selection clipboard -t image/png -i "$TMPFILE"
+    fi
+    info "Copied to clipboard."
+    if [[ $QUIET -eq 0 ]] && command -v notify-send &>/dev/null; then
+        notify-send "Screenshot copied to clipboard" --icon=camera-photo >/dev/null 2>&1 &
+    fi
     exit 0
 fi
 
